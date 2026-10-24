@@ -186,6 +186,11 @@ final class LCAppBannerViewController: UIViewController, UIContextMenuInteractio
                         await self?.saveIcon()
                     }
                 },
+                UIAction(title: "Export Signed Shortcut", image: UIImage(systemName: "square.and.arrow.up")) { [weak self] _ in
+                    Task { [weak self] in
+                        await self?.exportSignedShortcut()
+                    }
+                },
                 UIAction(title: "lc.appBanner.createAppClip".loc, image: UIImage(systemName: "appclip")) { [weak self] _ in
                     Task { [weak self] in
                         await self?.createAppClip()
@@ -301,6 +306,167 @@ final class LCAppBannerViewController: UIViewController, UIContextMenuInteractio
         } else {
             UIPasteboard.general.string = "livecontainer://livecontainer-launch?bundle-name=\(relativeBundlePath)"
         }
+    }
+
+    private func exportSignedShortcut() async {
+        let model = configuration.model
+        let appInfo = model.appInfo
+
+        if appInfo.isLocked && !DataManager.shared.model.isHiddenAppUnlocked {
+            do {
+                if !(try await LCUtils.authenticateUser()) {
+                    return
+                }
+            } catch {
+                showError(error.localizedDescription)
+                return
+            }
+        }
+
+        guard let bundleName = appInfo.relativeBundlePath else {
+            showError("Could not resolve the selected app bundle name.")
+            return
+        }
+
+        guard let scheme = (Bundle.main.object(forInfoDictionaryKey: "CFBundleURLTypes") as? [[String: Any]])?
+            .first?["CFBundleURLSchemes"] as? [String],
+              let launchScheme = scheme.first else {
+            showError("Could not determine this LiveContainer instance's URL scheme.")
+            return
+        }
+
+        var components = URLComponents()
+        components.scheme = launchScheme
+        components.host = "livecontainer-launch"
+        var queryItems = [URLQueryItem(name: "bundle-name", value: bundleName)]
+        if let folderName = model.uiSelectedContainer?.folderName {
+            queryItems.append(URLQueryItem(name: "container-folder-name", value: folderName))
+        }
+        components.queryItems = queryItems
+
+        guard let launchURL = components.url else {
+            showError("Could not build the LiveContainer launch URL.")
+            return
+        }
+
+        guard let style = await delegate.promptForGeneratedIconStyle(),
+              let icon = appInfo.generateLiveContainerWrappedIcon(with: style),
+              let iconData = icon.pngData() else {
+            return
+        }
+
+        do {
+            let workflow = makeLauncherWorkflow(name: model.displayName, launchURL: launchURL)
+            let unsignedData = try PropertyListSerialization.data(
+                fromPropertyList: workflow,
+                format: .xml,
+                options: 0
+            )
+            let signedData = try await signShortcutWithShortcuty(
+                unsignedData,
+                filename: model.displayName
+            )
+            guard signedData.starts(with: Data([0x41, 0x45, 0x41, 0x31])) else {
+                throw CocoaError(.fileReadCorruptFile)
+            }
+
+            cleanupExportTemporaryDirectory()
+            let temporaryDirectory = FileManager.default.temporaryDirectory
+                .appendingPathComponent(UUID().uuidString, isDirectory: true)
+            try FileManager.default.createDirectory(at: temporaryDirectory, withIntermediateDirectories: true)
+
+            let safeName = model.displayName
+                .replacingOccurrences(of: "/", with: "_")
+                .replacingOccurrences(of: ":", with: "_")
+            let shortcutURL = temporaryDirectory.appendingPathComponent("\(safeName).shortcut")
+            let iconURL = temporaryDirectory.appendingPathComponent("\(safeName) Icon.png")
+            try signedData.write(to: shortcutURL, options: .atomic)
+            try iconData.write(to: iconURL, options: .atomic)
+            exportTemporaryDirectory = temporaryDirectory
+
+            guard viewIfLoaded?.window != nil, presentedViewController == nil else {
+                cleanupExportTemporaryDirectory()
+                return
+            }
+
+            let activity = UIActivityViewController(
+                activityItems: [shortcutURL, iconURL],
+                applicationActivities: nil
+            )
+            activity.completionWithItemsHandler = { [weak self] _, _, _, _ in
+                self?.cleanupExportTemporaryDirectory()
+            }
+            present(activity, animated: true)
+        } catch {
+            cleanupExportTemporaryDirectory()
+            showError(error.localizedDescription)
+        }
+    }
+
+    private func makeLauncherWorkflow(name: String, launchURL: URL) -> [String: Any] {
+        let actionUUID = UUID().uuidString.uppercased()
+        let action: [String: Any] = [
+            "WFWorkflowActionIdentifier": "is.workflow.actions.openurl",
+            "WFWorkflowActionParameters": [
+                "UUID": actionUUID,
+                "WFInput": launchURL.absoluteString
+            ]
+        ]
+        return [
+            "WFQuickActionSurfaces": [],
+            "WFWorkflowActions": [action],
+            "WFWorkflowClientVersion": "4033.0.3.5",
+            "WFWorkflowHasOutputFallback": false,
+            "WFWorkflowHasShortcutInputVariables": false,
+            "WFWorkflowIcon": [
+                "WFWorkflowIconGlyphNumber": 59739,
+                "WFWorkflowIconStartColor": 431817727
+            ],
+            "WFWorkflowImportQuestions": [],
+            "WFWorkflowInputContentItemClasses": [
+                "WFAppContentItem", "WFAppStoreAppContentItem", "WFArticleContentItem",
+                "WFContactContentItem", "WFDateContentItem", "WFEmailAddressContentItem",
+                "WFFolderContentItem", "WFGenericFileContentItem", "WFImageContentItem",
+                "WFiTunesProductContentItem", "WFLocationContentItem", "WFDCMapsLinkContentItem",
+                "WFAVAssetContentItem", "WFPDFContentItem", "WFPhoneNumberContentItem",
+                "WFRichTextContentItem", "WFSafariWebPageContentItem", "WFStringContentItem",
+                "WFURLContentItem"
+            ],
+            "WFWorkflowMinimumClientVersion": 900,
+            "WFWorkflowMinimumClientVersionString": "900",
+            "WFWorkflowName": name,
+            "WFWorkflowOutputContentItemClasses": [],
+            "WFWorkflowTypes": ["WFWorkflowTypeShowInSearch"]
+        ]
+    }
+
+    private func signShortcutWithShortcuty(_ unsignedData: Data, filename: String) async throws -> Data {
+        let boundary = "LC2HS-\(UUID().uuidString)"
+        var request = URLRequest(url: URL(string: "https://sign.shortcuty.app/api/v1/sign")!)
+        request.httpMethod = "POST"
+        request.timeoutInterval = 120
+        request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
+        request.setValue("application/octet-stream", forHTTPHeaderField: "Accept")
+
+        let safeFilename = filename
+            .replacingOccurrences(of: "\\", with: "_")
+            .replacingOccurrences(of: "\"", with: "_")
+            .replacingOccurrences(of: "/", with: "_")
+        var body = Data()
+        body.append(Data("--\(boundary)\\r\\n".utf8))
+        body.append(Data("Content-Disposition: form-data; name=\"file\"; filename=\"\(safeFilename).shortcut\"\\r\\n".utf8))
+        body.append(Data("Content-Type: application/octet-stream\\r\\n\\r\\n".utf8))
+        body.append(unsignedData)
+        body.append(Data("\\r\\n--\(boundary)--\\r\\n".utf8))
+        request.httpBody = body
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let response = response as? HTTPURLResponse,
+              (200...299).contains(response.statusCode) else {
+            let serverMessage = String(data: data.prefix(1024), encoding: .utf8) ?? "Signing service returned an error."
+            throw NSError(domain: "LCShortcutSigning", code: (response as? HTTPURLResponse)?.statusCode ?? -1, userInfo: [NSLocalizedDescriptionKey: serverMessage])
+        }
+        return data
     }
 
     private func createAppClip() async {
