@@ -362,10 +362,18 @@ final class LCAppBannerViewController: UIViewController, UIContextMenuInteractio
                 format: .xml,
                 options: 0
             )
-            let signedData = try await signShortcutWithShortcuty(
-                unsignedData,
-                filename: model.displayName
-            )
+            let signedData: Data
+            do {
+                signedData = try await signShortcutWithHubSign(
+                    unsignedData,
+                    name: model.displayName
+                )
+            } catch {
+                signedData = try await signShortcutWithShortcuty(
+                    unsignedData,
+                    filename: model.displayName
+                )
+            }
             guard signedData.starts(with: Data([0x41, 0x45, 0x41, 0x31])) else {
                 throw CocoaError(.fileReadCorruptFile)
             }
@@ -442,6 +450,33 @@ final class LCAppBannerViewController: UIViewController, UIContextMenuInteractio
             "WFWorkflowOutputContentItemClasses": [],
             "WFWorkflowTypes": ["WFWorkflowTypeShowInSearch"]
         ]
+    }
+
+    private func signShortcutWithHubSign(_ unsignedData: Data, name: String) async throws -> Data {
+        let requestURL = URL(string: "https://hubsign.routinehub.services/sign")!
+        var request = URLRequest(url: requestURL)
+        request.httpMethod = "POST"
+        request.timeoutInterval = 120
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("application/octet-stream", forHTTPHeaderField: "Accept")
+        request.setValue("https://routinehub.co", forHTTPHeaderField: "Origin")
+        request.setValue("https://routinehub.co/", forHTTPHeaderField: "Referer")
+        request.httpBody = try JSONSerialization.data(withJSONObject: [
+            "shortcutName": name,
+            "shortcut": String(decoding: unsignedData, as: UTF8.self)
+        ])
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let response = response as? HTTPURLResponse,
+              (200...299).contains(response.statusCode),
+              data.starts(with: Data([0x41, 0x45, 0x41, 0x31])) else {
+            throw NSError(
+                domain: "LCHubSign",
+                code: (response as? HTTPURLResponse)?.statusCode ?? -1,
+                userInfo: [NSLocalizedDescriptionKey: "HubSign did not return a signed shortcut."]
+            )
+        }
+        return data
     }
 
     private func signShortcutWithShortcuty(_ unsignedData: Data, filename: String) async throws -> Data {
