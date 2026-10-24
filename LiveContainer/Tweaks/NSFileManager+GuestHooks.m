@@ -35,8 +35,12 @@ void NSFMGuestHooksInit(void) {
 @implementation NSFileManager(LiveContainerHooks)
 
 - (nullable NSURL *)hook_containerURLForSecurityApplicationGroupIdentifier:(NSString *)groupIdentifier {
-    if([groupIdentifier isEqualToString:[NSClassFromString(@"LCSharedUtils") appGroupID]]) {
-        return [NSURL fileURLWithPath: NSUserDefaults.lcAppGroupPath];
+    // During nested LiveContainer startup, appGroupID() probes this hook before
+    // lcAppGroupPath is assigned. Avoid calling appGroupID() recursively until
+    // that path exists, then resolve the guest's own group as a simulated group.
+    NSString *lcAppGroupPath = NSUserDefaults.lcAppGroupPath;
+    if (lcAppGroupPath && [groupIdentifier isEqualToString:[NSClassFromString(@"LCSharedUtils") appGroupID]]) {
+        return [NSURL fileURLWithPath:lcAppGroupPath];
     }
     NSURL *result;
     if(isolateAppGroup) {
