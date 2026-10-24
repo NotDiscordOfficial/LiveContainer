@@ -396,6 +396,10 @@ final class LCAppBannerViewController: UIViewController, UIContextMenuInteractio
             activity.completionWithItemsHandler = { [weak self] _, _, _, _ in
                 self?.cleanupExportTemporaryDirectory()
             }
+            if let popover = activity.popoverPresentationController {
+                popover.sourceView = bannerView
+                popover.sourceRect = bannerView.bounds
+            }
             present(activity, animated: true)
         } catch {
             cleanupExportTemporaryDirectory()
@@ -453,11 +457,11 @@ final class LCAppBannerViewController: UIViewController, UIContextMenuInteractio
             .replacingOccurrences(of: "\"", with: "_")
             .replacingOccurrences(of: "/", with: "_")
         var body = Data()
-        body.append(Data("--\(boundary)\\r\\n".utf8))
-        body.append(Data("Content-Disposition: form-data; name=\"file\"; filename=\"\(safeFilename).shortcut\"\\r\\n".utf8))
-        body.append(Data("Content-Type: application/octet-stream\\r\\n\\r\\n".utf8))
+        body.append(Data("--\(boundary)\r\n".utf8))
+        body.append(Data("Content-Disposition: form-data; name=\"file\"; filename=\"\(safeFilename).shortcut\"\r\n".utf8))
+        body.append(Data("Content-Type: application/octet-stream\r\n\r\n".utf8))
         body.append(unsignedData)
-        body.append(Data("\\r\\n--\(boundary)--\\r\\n".utf8))
+        body.append(Data("\r\n--\(boundary)--\r\n".utf8))
         request.httpBody = body
 
         let (data, response) = try await URLSession.shared.data(for: request)
